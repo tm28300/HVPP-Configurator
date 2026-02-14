@@ -1,0 +1,4 @@
+# Dépendances Python pour HVPP Configurator GUI
+
+# Communication série
+pyserial>=3.5
