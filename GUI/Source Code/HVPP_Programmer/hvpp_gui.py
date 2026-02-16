@@ -6,14 +6,212 @@ Cross-platform GUI using tkinter (compatible with Windows, Linux x86_64, Linux A
 
 import sys
 import threading
+import json
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable, Union
 from hvpp_programmer import AtmelHighVoltageParallelProgrammer, HVPPCommand
+import serial
 
 # Debug messages control variable
 DEBUG_PRINT = False
+
+
+class ToolTip:
+    """Create a tooltip (info-bubble) for a given widget"""
+
+    def __init__(self, widget, text: Union[str, Callable[[], str]], delay: int = 500):
+        """
+        Args:
+            widget: The widget to attach the tooltip to
+            text: Text to display in the tooltip (string or callable returning string)
+            delay: Delay in milliseconds before showing tooltip
+        """
+        self.widget = widget
+        self.text_source = text
+        self.delay = delay
+        self.tip_window = None
+        self.timer_id = None
+
+        # Bind events
+        self.widget.bind("<Enter>", self._on_enter)
+        self.widget.bind("<Leave>", self._on_leave)
+        self.widget.bind("<Button>", self._on_leave)
+
+    def _on_enter(self, event=None):
+        """Mouse enters widget - schedule tooltip display"""
+        self._cancel_timer()
+        self.timer_id = self.widget.after(self.delay, self._show_tip)
+
+    def _on_leave(self, event=None):
+        """Mouse leaves widget or button pressed - hide tooltip"""
+        self._cancel_timer()
+        self._hide_tip()
+
+    def _cancel_timer(self):
+        """Cancel scheduled tooltip display"""
+        if self.timer_id:
+            self.widget.after_cancel(self.timer_id)
+            self.timer_id = None
+
+    def _show_tip(self):
+        """Display the tooltip"""
+        # Get text (call function if callable)
+        text = self.text_source() if callable(self.text_source) else self.text_source
+
+        if self.tip_window or not text:
+            return
+
+        # Get widget position
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+
+        # Create tooltip window
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)  # Remove window decorations
+        tw.wm_geometry(f"+{x}+{y}")
+
+        # Create label with tooltip text
+        label = tk.Label(
+            tw,
+            text=text,
+            justify=tk.LEFT,
+            background="#ffffe0",
+            relief=tk.SOLID,
+            borderwidth=1,
+            font=("Arial", 9, "normal"),
+            padx=4,
+            pady=2
+        )
+        label.pack()
+
+    def _hide_tip(self):
+        """Hide the tooltip"""
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
+class FuseDefinitions:
+    """Manage fuse/lock definitions from JSON file"""
+
+    def __init__(self, json_path: Path):
+        """
+        Args:
+            json_path: Path to the fuse definitions JSON file
+        """
+        self.definitions = {}
+        self._load_definitions(json_path)
+
+    def _load_definitions(self, json_path: Path):
+        """Load fuse definitions from JSON file"""
+        try:
+            if json_path.exists():
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    self.definitions = json.load(f)
+        except Exception as e:
+            if DEBUG_PRINT:
+                print(f"Error loading fuse definitions: {e}")
+            self.definitions = {}
+
+    def get_fuse_tooltip(self, chip: str, fuse_type: str, current_value: Optional[str] = None) -> str:
+        """
+        Generate tooltip text for a fuse/lock byte
+
+        Args:
+            chip: Chip name (e.g., "ATMEGA1284(P)")
+            fuse_type: Type of fuse ("low", "high", "ext", "lock")
+            current_value: Current hex value (e.g., "0xFF") to highlight in tooltip
+
+        Returns:
+            Formatted tooltip text or empty string if no definition available
+        """
+        # Check if chip exists in definitions
+        if chip not in self.definitions:
+            return ""
+
+        # Check if fuse type exists for this chip
+        if fuse_type not in self.definitions[chip]:
+            return ""
+
+        # Parse current value if provided
+        current_byte = None
+        if current_value:
+            try:
+                # Remove "0x" prefix if present and convert to int
+                val_str = current_value.strip()
+                if val_str.lower().startswith("0x"):
+                    current_byte = int(val_str, 16)
+                else:
+                    current_byte = int(val_str, 16)
+            except (ValueError, AttributeError):
+                current_byte = None
+
+        # Build tooltip text
+        lines = []
+        fuse_groups = self.definitions[chip][fuse_type]
+
+        for group in fuse_groups:
+            bits = group["bits"]
+            label = group.get("label", "")
+            values = group.get("values", {})
+
+            # Format bit range
+            if len(bits) == 1:
+                bit_range = f"Bit {bits[0]}"
+            else:
+                bit_range = f"Bits {bits[0]}-{bits[-1]}"
+
+            # Add group header
+            if label:
+                lines.append(f"═══ {bit_range}: {label} ═══")
+            else:
+                lines.append(f"═══ {bit_range} ═══")
+
+            # Extract current value for this bit group
+            current_group_value = None
+            if current_byte is not None:
+                current_group_value = self._extract_bits(current_byte, bits)
+
+            # Add values
+            # Get max value for this bit group
+            max_value = (1 << len(bits)) - 1
+
+            for i in range(max_value + 1):
+                value_str = str(i)
+                if value_str in values:
+                    label_text = values[value_str]
+                    # Highlight current value
+                    if current_group_value == i:
+                        lines.append(f"  → {i}: {label_text}")
+                    else:
+                        lines.append(f"    {i}: {label_text}")
+                else:
+                    # Only show reserved if it's the current value
+                    if current_group_value == i:
+                        lines.append(f"  → {i}: Réservé")
+
+            lines.append("")  # Empty line between groups
+
+        return "\n".join(lines).rstrip()
+
+    def _extract_bits(self, byte_value: int, bits: list) -> int:
+        """
+        Extract specific bits from a byte value
+
+        Args:
+            byte_value: The byte value (0-255)
+            bits: List of bit positions (0-7, from LSB to MSB)
+
+        Returns:
+            The extracted value
+        """
+        result = 0
+        for i, bit_pos in enumerate(bits):
+            if byte_value & (1 << bit_pos):
+                result |= (1 << i)
+        return result
 
 
 class HVPPConfiguratorGUI:
@@ -28,6 +226,75 @@ class HVPPConfiguratorGUI:
         "ATTINY2313(V)",
         "ATMEGA1284(P)"
     ]
+
+    @staticmethod
+    def _parse_programmer_response(response: str) -> tuple[bool, str]:
+        """
+        Parse programmer response to check success/failure and extract error message
+
+        Args:
+            response: Response from programmer
+
+        Returns:
+            Tuple of (success: bool, message: str)
+            - If response is "0", returns (True, "")
+            - If response is "1 <message>", returns (False, "<message>")
+            - If response is "1" alone, returns (False, "")
+            - Otherwise returns (False, "")
+        """
+        if not response:
+            return (False, "")
+
+        if response == "0":
+            return (True, "")
+
+        if response.startswith("1 "):
+            # Extract error message after "1 "
+            error_msg = response[2:].strip()
+            return (False, error_msg)
+
+        if response == "1":
+            return (False, "")
+
+        # Unexpected response
+        return (False, "")
+
+    def _handle_programmer_response(
+        self,
+        result: str,
+        success_message: str,
+        error_context: str = "",
+        success_title: str = "Information",
+        generic_error: str = "Error communicating with the programmer."
+    ) -> bool:
+        """
+        Handle programmer response: parse it and show appropriate message
+
+        Args:
+            result: Response from programmer
+            success_message: Message to show on success
+            error_context: Context for error message (e.g., "write low fuse")
+            success_title: Title for success dialog ("Information" or "Success")
+            generic_error: Generic error message if no specific error from programmer
+
+        Returns:
+            True if success, False otherwise
+        """
+        success, error_msg = self._parse_programmer_response(result)
+        if success:
+            messagebox.showinfo(success_title, success_message)
+            return True
+        else:
+            box_details: str
+            if error_msg:
+                if error_context:
+                    box_details = f"Failed to {error_context}: {error_msg}"
+                else:
+                    box_details = error_msg
+            else:
+                box_details = generic_error
+            messagebox.showerror("Error", box_details)
+            return False
 
     def __init__(self, root: tk.Tk):
         """
@@ -62,13 +329,22 @@ class HVPPConfiguratorGUI:
 
         self.programmer: Optional[AtmelHighVoltageParallelProgrammer] = None
         self._operation_thread: Optional[threading.Thread] = None
+
+        # Load fuse definitions
+        base_path = Path(__file__).parent
+        fuse_definitions_path = base_path / "fuse_definitions.json"
+        self.fuse_defs = FuseDefinitions(fuse_definitions_path)
         self._stop_event = threading.Event()
         self._busy = False
+        self._is_connected = False  # Track connection state
 
         self._create_widgets()
         self._load_ports()
 
         self._init_busy_widgets()
+
+        # Initialize to disconnected state
+        self._update_connection_state(False)
 
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -153,21 +429,29 @@ class HVPPConfiguratorGUI:
         ttk.Label(fuse_frame, text="Low Fuse:").grid(row=0, column=0, sticky="w", padx=5)
         self.lfuse_entry = ttk.Entry(fuse_frame, width=10, justify="center")
         self.lfuse_entry.grid(row=0, column=1, padx=5)
+        ToolTip(self.lfuse_entry, lambda: self.fuse_defs.get_fuse_tooltip(
+            self.chip_combo.get(), "low", self.lfuse_entry.get()))
 
         # High Fuse
         ttk.Label(fuse_frame, text="High Fuse:").grid(row=0, column=2, sticky="w", padx=5)
         self.hfuse_entry = ttk.Entry(fuse_frame, width=10, justify="center")
         self.hfuse_entry.grid(row=0, column=3, padx=5)
+        ToolTip(self.hfuse_entry, lambda: self.fuse_defs.get_fuse_tooltip(
+            self.chip_combo.get(), "high", self.hfuse_entry.get()))
 
         # Extended Fuse
         ttk.Label(fuse_frame, text="Extended Fuse:").grid(row=0, column=4, sticky="w", padx=5)
         self.efuse_entry = ttk.Entry(fuse_frame, width=10, justify="center")
         self.efuse_entry.grid(row=0, column=5, padx=5)
+        ToolTip(self.efuse_entry, lambda: self.fuse_defs.get_fuse_tooltip(
+            self.chip_combo.get(), "ext", self.efuse_entry.get()))
 
         # Lock Byte
         ttk.Label(fuse_frame, text="Lock Byte:").grid(row=0, column=6, sticky="w", padx=5)
         self.lock_entry = ttk.Entry(fuse_frame, width=10, justify="center")
         self.lock_entry.grid(row=0, column=7, padx=5)
+        ToolTip(self.lock_entry, lambda: self.fuse_defs.get_fuse_tooltip(
+            self.chip_combo.get(), "lock", self.lock_entry.get()))
 
         # Read Fuses button
         self.read_fuses_btn = ttk.Button(fuse_frame, text="Read Fuses", command=self._on_read_fuses)
@@ -274,6 +558,74 @@ class HVPPConfiguratorGUI:
         self.operation_label.config(text="")
         self.progress_label.config(text="")
 
+    def _update_connection_state(self, connected: bool):
+        """
+        Update widget states based on connection status
+
+        Args:
+            connected: True if programmer is connected, False otherwise
+        """
+        self._is_connected = connected
+
+        if connected:
+            # Disable connection controls
+            self.chip_combo.config(state="disabled")
+            self.port_combo.config(state="disabled")
+            self.connect_btn.config(state="disabled")
+
+            # Enable programmer operation buttons
+            self.disconnect_btn.config(state="normal")
+            self.read_sig_btn.config(state="normal")
+            self.read_cal_btn.config(state="normal")
+            self.erase_btn.config(state="normal")
+            self.lock_btn.config(state="normal")
+            self.read_fuses_btn.config(state="normal")
+            self.write_lfuse_btn.config(state="normal")
+            self.write_hfuse_btn.config(state="normal")
+            self.write_efuse_btn.config(state="normal")
+            self.read_flash_btn.config(state="normal")
+            self.write_flash_btn.config(state="normal")
+            self.read_eeprom_btn.config(state="normal")
+            self.write_eeprom_btn.config(state="normal")
+        else:
+            # Enable connection controls
+            self.chip_combo.config(state="readonly")
+            self.port_combo.config(state="readonly")
+            self.connect_btn.config(state="normal")
+
+            # Disable all programmer operation buttons
+            self.disconnect_btn.config(state="disabled")
+            self.read_sig_btn.config(state="disabled")
+            self.read_cal_btn.config(state="disabled")
+            self.erase_btn.config(state="disabled")
+            self.lock_btn.config(state="disabled")
+            self.read_fuses_btn.config(state="disabled")
+            self.write_lfuse_btn.config(state="disabled")
+            self.write_hfuse_btn.config(state="disabled")
+            self.write_efuse_btn.config(state="disabled")
+            self.read_flash_btn.config(state="disabled")
+            self.write_flash_btn.config(state="disabled")
+            self.read_eeprom_btn.config(state="disabled")
+            self.write_eeprom_btn.config(state="disabled")
+
+    def _handle_disconnection(self):
+        """Handle programmer disconnection (e.g., cable unplugged, port unavailable)"""
+        if self.programmer:
+            try:
+                self.programmer.close()
+            except:
+                pass
+            self.programmer = None
+
+        # Disable Programmer Log option
+        self.log_menu_item.entryconfig(self.log_menu_index, state="disabled")
+
+        # Update to disconnected state
+        self._update_connection_state(False)
+
+        messagebox.showerror("Connection Lost",
+            "Connection to the programmer has been lost.\\n\\nPlease check the cable and reconnect.")
+
     def _on_connect(self):
         """Handle Connect button click"""
         chip = self.chip_combo.get()
@@ -294,14 +646,39 @@ class HVPPConfiguratorGUI:
 
             result = self.programmer.programmer_communicate(HVPPCommand.OPEN, "")
 
-            if result == "0":
-                messagebox.showinfo("Information",
-                    "HVPP mode has been enabled successfully.")
-            else:
+            if self._handle_programmer_response(
+                result,
+                "HVPP mode has been enabled successfully.",
+                error_context="enable HVPP mode"
+            ):
+                # Update to connected state
+                self._update_connection_state(True)
+        except serial.SerialException as e:
+            # Port already in use or unavailable
+            error_msg = str(e)
+            if "Access is denied" in error_msg or "Permission denied" in error_msg:
                 messagebox.showerror("Error",
-                    "Error communicating with the programmer.")
+                    f"Port {port} is already in use by another application.\n\nPlease close the other application and try again.")
+            else:
+                messagebox.showerror("Error", f"Serial port error: {error_msg}")
+            # Ensure disconnected state
+            self._update_connection_state(False)
+            if self.programmer:
+                try:
+                    self.programmer.close()
+                except:
+                    pass
+                self.programmer = None
         except Exception as e:
             messagebox.showerror("Error", f"Failed to connect: {str(e)}")
+            # Ensure disconnected state
+            self._update_connection_state(False)
+            if self.programmer:
+                try:
+                    self.programmer.close()
+                except:
+                    pass
+                self.programmer = None
 
     def _on_read_signature(self):
         """Handle Read Signature button click"""
@@ -309,18 +686,23 @@ class HVPPConfiguratorGUI:
             messagebox.showwarning("Warning", "Please connect to the programmer first.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.READ_SIGNATURE, "")
-        self.signature_entry.delete(0, tk.END)
-        self.signature_entry.insert(0, result)
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.READ_SIGNATURE, "")
+            self.signature_entry.delete(0, tk.END)
+            self.signature_entry.insert(0, result)
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_disconnect(self):
         """Handle Disconnect button click"""
         if self.programmer:
             result = self.programmer.programmer_communicate(HVPPCommand.END, "")
 
-            if result == "0":
-                messagebox.showinfo("Information",
-                    "HVPP mode has ended successfully.")
+            if self._handle_programmer_response(
+                result,
+                "HVPP mode has ended successfully.",
+                error_context="end HVPP mode"
+            ):
                 # Disable Programmer Log option
                 self.log_menu_item.entryconfig(self.log_menu_index, state="disabled")
 
@@ -331,9 +713,9 @@ class HVPPConfiguratorGUI:
                 self.hfuse_entry.delete(0, tk.END)
                 self.efuse_entry.delete(0, tk.END)
                 self.lock_entry.delete(0, tk.END)
-            else:
-                messagebox.showerror("Error",
-                    "Error communicating with the programmer.")
+
+                # Update to disconnected state
+                self._update_connection_state(False)
 
     def _on_read_fuses(self):
         """Handle Read Fuses button click"""
@@ -341,29 +723,32 @@ class HVPPConfiguratorGUI:
             messagebox.showwarning("Warning", "Please connect to the programmer first.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.READ_FUSES, "")
-        if DEBUG_PRINT:
-            print(f"DEBUG _on_read_fuses: résultat brut = '{result}' (longueur: {len(result)})")
-
-        fuses = result.split(' ')
-        if DEBUG_PRINT:
-            print(f"DEBUG _on_read_fuses: fuses après split = {fuses} (nombre: {len(fuses)})")
-        if len(fuses) >= 4:
-            self.lfuse_entry.delete(0, tk.END)
-            self.lfuse_entry.insert(0, fuses[0])
-
-            self.hfuse_entry.delete(0, tk.END)
-            self.hfuse_entry.insert(0, fuses[1])
-
-            self.efuse_entry.delete(0, tk.END)
-            self.efuse_entry.insert(0, fuses[2])
-
-            self.lock_entry.delete(0, tk.END)
-            self.lock_entry.insert(0, fuses[3])
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.READ_FUSES, "")
             if DEBUG_PRINT:
-                print("DEBUG _on_read_fuses: data displayed in fields")
-        else:
-            messagebox.showerror("Error", f"Invalid response format. Received: '{result}' ({len(fuses)} elements instead of 4)")
+                print(f"DEBUG _on_read_fuses: résultat brut = '{result}' (longueur: {len(result)})")
+
+            fuses = result.split(' ')
+            if DEBUG_PRINT:
+                print(f"DEBUG _on_read_fuses: fuses après split = {fuses} (nombre: {len(fuses)})")
+            if len(fuses) >= 4:
+                self.lfuse_entry.delete(0, tk.END)
+                self.lfuse_entry.insert(0, fuses[0])
+
+                self.hfuse_entry.delete(0, tk.END)
+                self.hfuse_entry.insert(0, fuses[1])
+
+                self.efuse_entry.delete(0, tk.END)
+                self.efuse_entry.insert(0, fuses[2])
+
+                self.lock_entry.delete(0, tk.END)
+                self.lock_entry.insert(0, fuses[3])
+                if DEBUG_PRINT:
+                    print("DEBUG _on_read_fuses: data displayed in fields")
+            else:
+                messagebox.showerror("Error", f"Invalid response format. Received: '{result}' ({len(fuses)} elements instead of 4)")
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_read_calibration(self):
         """Handle Read Calibration Byte button click"""
@@ -388,10 +773,11 @@ class HVPPConfiguratorGUI:
 
         result = self.programmer.programmer_communicate(HVPPCommand.WRITE_LFUSE, lfuse)
 
-        if result == "0":
-            messagebox.showinfo("Information", "Low fuse has been saved successfully.")
-        else:
-            messagebox.showerror("Error", "Error communicating with the programmer.")
+        self._handle_programmer_response(
+            result,
+            "Low fuse has been saved successfully.",
+            error_context="write low fuse"
+        )
 
     def _on_write_hfuse(self):
         """Handle Write High Fuse button click"""
@@ -406,10 +792,11 @@ class HVPPConfiguratorGUI:
 
         result = self.programmer.programmer_communicate(HVPPCommand.WRITE_HFUSE, hfuse)
 
-        if result == "0":
-            messagebox.showinfo("Information", "High fuse has been saved successfully.")
-        else:
-            messagebox.showerror("Error", "Error communicating with the programmer.")
+        self._handle_programmer_response(
+            result,
+            "High fuse has been saved successfully.",
+            error_context="write high fuse"
+        )
 
     def _on_write_efuse(self):
         """Handle Write Extended Fuse button click"""
@@ -424,10 +811,11 @@ class HVPPConfiguratorGUI:
 
         result = self.programmer.programmer_communicate(HVPPCommand.WRITE_EXT_FUSE, efuse)
 
-        if result == "0":
-            messagebox.showinfo("Information", "Extended fuse has been saved successfully.")
-        else:
-            messagebox.showerror("Error", "Error communicating with the programmer.")
+        self._handle_programmer_response(
+            result,
+            "Extended fuse has been saved successfully.",
+            error_context="write extended fuse"
+        )
 
     def _on_erase_chip(self):
         """Handle Erase Chip button click"""
@@ -437,10 +825,11 @@ class HVPPConfiguratorGUI:
 
         result = self.programmer.programmer_communicate(HVPPCommand.CHIP_ERASE, "")
 
-        if result == "0":
-            messagebox.showinfo("Information", "Chip has been erased successfully.")
-        else:
-            messagebox.showerror("Error", "Error communicating with the programmer.")
+        self._handle_programmer_response(
+            result,
+            "Chip has been erased successfully.",
+            error_context="erase chip"
+        )
 
     def _on_write_lock(self):
         """Handle Write Lock Byte button click"""
@@ -450,10 +839,11 @@ class HVPPConfiguratorGUI:
 
         result = self.programmer.programmer_communicate(HVPPCommand.WRITE_LOCK_BYTE, "")
 
-        if result == "0":
-            messagebox.showinfo("Information", "Lock byte has been saved successfully.")
-        else:
-            messagebox.showerror("Error", "Error communicating with the programmer.")
+        self._handle_programmer_response(
+            result,
+            "Lock byte has been saved successfully.",
+            error_context="write lock byte"
+        )
 
     def _on_log_programmer(self):
         """Handle Programmer Log menu option"""
@@ -539,14 +929,30 @@ class HVPPConfiguratorGUI:
 
             if error:
                 if str(error) != "Operation stopped":
-                    messagebox.showerror("Error", f"{label} failed: {str(error)}")
+                    # Check if error message is a firmware response (starts with "0" or "1")
+                    error_msg = str(error)
+                    if error_msg and (error_msg.startswith("0") or error_msg.startswith("1")):
+                        # Parse as firmware response
+                        self._handle_programmer_response(
+                            error_msg,
+                            success_message,
+                            error_context=label,
+                            success_title="Success",
+                            generic_error=f"{label} failed."
+                        )
+                    else:
+                        # Regular exception message
+                        messagebox.showerror("Error", f"{label} failed: {error_msg}")
                 self._clear_progress()
                 return
 
-            if result == "0":
-                messagebox.showinfo("Success", success_message)
-            else:
-                messagebox.showerror("Error", f"{label} failed.")
+            self._handle_programmer_response(
+                result,
+                success_message,
+                error_context=label,
+                success_title="Success",
+                generic_error=f"{label} failed."
+            )
             self._clear_progress()
 
         def worker():

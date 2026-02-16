@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Callable, Optional, TypedDict
 
 # Debug messages control variable
-DEBUG_PRINT = False
+DEBUG_PRINT = True
 
 
 class ChipProperties(TypedDict):
@@ -205,21 +205,21 @@ class AtmelHighVoltageParallelProgrammer:
         if cmd == HVPPCommand.OPEN:
             if DEBUG_PRINT:
                 print(f"Sending command 00{self.chip_id}")
-            result = self._send_command("00", self.chip_id, 1)
+            result = self._send_command("00", self.chip_id, 0)
         elif cmd == HVPPCommand.READ_SIGNATURE:
             result = self._send_command("01", "", 6)
         elif cmd == HVPPCommand.READ_FUSES:
             result = self._send_command("02", "", 11)
         elif cmd == HVPPCommand.WRITE_LFUSE:
-            result = self._send_command("03", parameters, 1)
+            result = self._send_command("03", parameters, 0)
         elif cmd == HVPPCommand.WRITE_HFUSE:
-            result = self._send_command("04", parameters, 1)
+            result = self._send_command("04", parameters, 0)
         elif cmd == HVPPCommand.WRITE_EXT_FUSE:
-            result = self._send_command("05", parameters, 1)
+            result = self._send_command("05", parameters, 0)
         elif cmd == HVPPCommand.WRITE_LOCK_BYTE:
-            result = self._send_command("06", "", 1)
+            result = self._send_command("06", "", 0)
         elif cmd == HVPPCommand.CHIP_ERASE:
-            result = self._send_command("07", "", 1)
+            result = self._send_command("07", "", 0)
         elif cmd == HVPPCommand.READ_CALIBRATION_BYTE:
             result = self._send_command("08", "", 2)
         elif cmd == HVPPCommand.READ_MEMORY:
@@ -255,11 +255,9 @@ class AtmelHighVoltageParallelProgrammer:
             if DEBUG_PRINT:
                 print(f"WRITE_MEMORY parsed -> memory_type='{memory_type}', filename='{filename}'")
             if memory_type.lower() == "flash":
-                self._write_flash_memory(filename, progress_callback, stop_event)
-                result = "0"  # Success
+                result = self._write_flash_memory(filename, progress_callback, stop_event)
             elif memory_type.lower() == "eeprom":
-                self._write_eeprom_memory(filename, progress_callback, stop_event)
-                result = "0"  # Success
+                result = self._write_eeprom_memory(filename, progress_callback, stop_event)
             else:
                 raise ValueError(f"Unknown memory type: {memory_type}")
         elif cmd == HVPPCommand.LOG:
@@ -287,16 +285,7 @@ class AtmelHighVoltageParallelProgrammer:
 
         if expected_length == 0:
             # Wait with timeout
-            count = 0
-            self.data_received_ready = False
-            self.in_string = ""
-            while not self.data_received_ready and count < 5:
-                if DEBUG_PRINT:
-                    print("Waiting for data, 5 times")
-                self._read_data()
-                count += 1
-                time.sleep(0.3)
-            return self.in_string
+            return self._read_response_until_newline(timeout_seconds=5.0)
 
         # Wait until expected length received
         result = self._read_response(expected_length, timeout_seconds=5.0)
@@ -340,16 +329,42 @@ class AtmelHighVoltageParallelProgrammer:
                 print(f"Raw data sending ERROR: {ex}")
 
     def _read_response(self, expected_length: int, timeout_seconds: float = 5.0) -> str:
-        """Read response from serial port without sending a command."""
+        """Read response from serial port without sending a command.
+
+        If response starts with '1 ' (error with message), wait for \r\n regardless of expected_length.
+        """
         self.data_received_ready = False
         self.in_string = ""
 
         timeout = time.time() + timeout_seconds
         while not self.data_received_ready and len(self.in_string) < expected_length:
             if time.time() > timeout:
+                print("Timeout waiting for response (no data received)")
                 break
             self._read_data()
+
             time.sleep(0.005)
+
+        return self.in_string
+
+    def _read_response_until_newline(self, timeout_seconds: float = 5.0) -> str:
+        """Read response from serial port until \r\n is received.
+
+        This is the same algorithm as _send_command with expected_length=0.
+        Used when we don't know the size of the response (e.g., error messages).
+        """
+        self.data_received_ready = False
+        self.in_string = ""
+        timeout = time.time() + timeout_seconds
+        while not self.data_received_ready:
+            if time.time() > timeout:
+                if len(self.in_string) == 0:
+                    self.in_string = "1 Timeout waiting for response (no data received)"
+                    if DEBUG_PRINT:
+                        print("Timeout waiting for response (no data received)")
+                break
+            self._read_data()
+            time.sleep(0.3)
 
         return self.in_string
 
@@ -597,13 +612,15 @@ class AtmelHighVoltageParallelProgrammer:
 
         segments.append((start, bytes(current)))
 
-        # Split segments if they exceed 255 bytes
+        # Split segments if they exceed page boundary
         split_segments: list[tuple[int, bytes]] = []
         for start, data in segments:
             offset_index = 0
             while offset_index < len(data):
-                chunk = data[offset_index:offset_index + 255]
-                split_segments.append((start + offset_index, chunk))
+                current_offset = start + offset_index
+                max_chunk_size = page_bytes - current_offset
+                chunk = data[offset_index:offset_index + max_chunk_size]
+                split_segments.append((current_offset, chunk))
                 offset_index += len(chunk)
 
         return split_segments
@@ -709,11 +726,15 @@ class AtmelHighVoltageParallelProgrammer:
         filename: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         stop_event: Optional[threading.Event] = None,
-    ) -> None:
-        """Write Flash memory from an Intel HEX file."""
+    ) -> str:
+        """Write Flash memory from an Intel HEX file.
+
+        Returns:
+            "0" on success, or firmware error response
+        """
         page_words = self.chip_props["flash_page_size"]
         total_size = self.chip_props["flash_total_size"]
-        self._write_memory_from_hex(
+        return self._write_memory_from_hex(
             filename=filename,
             total_size=total_size,
             page_size=page_words,
@@ -728,11 +749,15 @@ class AtmelHighVoltageParallelProgrammer:
         filename: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         stop_event: Optional[threading.Event] = None,
-    ) -> None:
-        """Write EEPROM memory from an Intel HEX file."""
+    ) -> str:
+        """Write EEPROM memory from an Intel HEX file.
+
+        Returns:
+            "0" on success, or firmware error response
+        """
         page_bytes = self.chip_props["eeprom_page_size"]
         total_size = self.chip_props["eeprom_total_size"]
-        self._write_memory_from_hex(
+        return self._write_memory_from_hex(
             filename=filename,
             total_size=total_size,
             page_size=page_bytes,
@@ -751,8 +776,12 @@ class AtmelHighVoltageParallelProgrammer:
         memory_label: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         stop_event: Optional[threading.Event] = None,
-    ) -> None:
-        """Write memory from an Intel HEX file using page segments."""
+    ) -> str:
+        """Write memory from an Intel HEX file using page segments.
+
+        Returns:
+            "0" on success, or firmware error response
+        """
         page_bytes = page_size * 2 if memory_type == 0x01 else page_size
 
         if DEBUG_PRINT:
@@ -789,7 +818,11 @@ class AtmelHighVoltageParallelProgrammer:
 
             segments = self._segment_page_data(page_bytes, list(values.keys()), values)
             for offset, data in segments:
-                self._write_memory_page(page_size, page_number, memory_type, offset, data)
+                response = self._write_memory_page(page_size, page_number, memory_type, offset, data)
+                # Check response for each segment write
+                if response != "0":
+                    # Return first error encountered
+                    return response
 
             if progress_callback:
                 progress_callback(page_index + 1, total_pages)
@@ -800,6 +833,8 @@ class AtmelHighVoltageParallelProgrammer:
         if DEBUG_PRINT:
             print(f"{memory_label} write completed successfully")
 
+        return "0"  # Success
+
     def _write_memory_page(
         self,
         page_size: int,
@@ -807,37 +842,72 @@ class AtmelHighVoltageParallelProgrammer:
         memory_type: int,
         offset: int,
         data: bytes,
-    ) -> None:
-        """Write a page segment to memory with offset/length and CRC."""
+    ) -> str:
+        """Write a page segment to memory with offset/length and CRC.
+
+        Returns:
+            "0" on success, or firmware error response (e.g., "1 Checksum invalide...")
+        """
         if offset + len(data) > (page_size * 2 if memory_type == 0x01 else page_size):
             raise RuntimeError("Offset + length exceeds page size")
 
         if len(data) == 0:
-            return
-
-        if offset > 0xFF or len(data) > 0xFF:
-            raise RuntimeError("Offset/length must fit in one byte")
+            return "0"  # No data to write, return success
 
         # Command format: 10ssppppttooll
-        cmd = f"10{page_size:02X}{page_number:04X}{memory_type:02X}{offset:02X}{len(data):02X}"
+        # For Flash, firmware expects length in words; for EEPROM, in bytes
+        write_length = len(data) // 2 if memory_type == 0x01 else len(data)
+
+        if offset > 0xFF or write_length > 0xFF:
+            raise RuntimeError("Offset/length must fit in one byte")
+
+        cmd = f"10{page_size:02X}{page_number:04X}{memory_type:02X}{offset:02X}{write_length:02X}"
 
         if DEBUG_PRINT:
             unit = "words" if memory_type == 0x01 else "bytes"
             print(
                 f"Writing memory page: cmd={cmd} (page_size={page_size} {unit}, page={page_number}, "
-                f"offset={offset}, length={len(data)})"
+                f"offset={offset}, length={write_length} {unit}, data_bytes={len(data)})"
             )
 
         self._send_data(cmd)
+
+        # Wait for firmware acknowledgment "+" before sending data
+        ack = self._read_response_until_newline(timeout_seconds=5.0)
+
+        if DEBUG_PRINT:
+            print(f"Firmware acknowledgment: '{ack}'")
+
+        # Check if firmware is ready (sends "+") or returned an error
+        if ack != "+":
+            # Firmware returned an error instead of acknowledgment
+            if DEBUG_PRINT:
+                print(f"Firmware error before data transmission: '{ack}'")
+            return ack
+
+        # Firmware is ready, send data and CRC
+        if DEBUG_PRINT:
+            preview_len = min(16, len(data))
+            preview_hex = " ".join(f"{b:02X}" for b in data[:preview_len])
+            print(f"Sending data ({len(data)} bytes), preview: {preview_hex}")
+
         self._send_bytes(data)
         crc = self._calculate_crc16(data)
+
+        if DEBUG_PRINT:
+            print(f"Calculated CRC: 0x{crc:04X}")
+            crc_bytes = crc.to_bytes(2, byteorder="little")
+            print(f"Sending CRC bytes (little-endian): {crc_bytes[0]:02X} {crc_bytes[1]:02X}")
+
         self._send_bytes(crc.to_bytes(2, byteorder="little"))
 
-        response = self._read_response(1)
+        # Read final response until \r\n (we don't know the size of error messages)
+        response = self._read_response_until_newline(timeout_seconds=5.0)
+
         if DEBUG_PRINT:
             print(f"Write response: '{response}'")
-        if response and response != "0":
-            raise RuntimeError(f"Write failed with response: '{response}'")
+
+        return response
 
     @staticmethod
     def _write_intel_hex(filename: str, data: bytearray) -> None:

@@ -1,0 +1,160 @@
+{
+  "ATMEGA1284(P)": {
+    "low": [
+      {
+        "bits": [0, 1, 2, 3],
+        "label": "Source d'horloge",
+        "values": {
+          "0": "Horloge externe",
+          "2": "Résonateur interne calibré 8 MHz",
+          "3": "Résonateur interne 128 kHz",
+          "4": "Quartz externe basse fréquence",
+          "5": "Quartz externe basse fréquence",
+          "6": "Quartz externe en mode pleine « aptitude »",
+          "7": "Quartz externe en mode pleine « aptitude »",
+          "8": "Quartz externe basse puissance 0,4 à 0,9 MHz",
+          "9": "Quartz externe basse puissance 0,4 à 0,9 MHz",
+          "10": "Quartz externe basse puissance 0,9 à 3 MHz",
+          "11": "Quartz externe basse puissance 0,9 à 3 MHz",
+          "12": "Quartz externe basse puissance 3 à 8 MHz",
+          "13": "Quartz externe basse puissance 3 à 8 MHz",
+          "14": "Quartz externe basse puissance 8 à 16 MHz",
+          "15": "Quartz externe basse puissance 8 à 16 MHz"
+        }
+      },
+      {
+        "bits": [4, 5, 6],
+        "label": "Temps de démarrage",
+        "values": {
+          "0": "Démarrage 258CK, Reset 14CK + 4,1ms (résonateur céramique, montée d'alimentation rapide)",
+          "1": "Démarrage 258CK, Reset 14CK + 65ms (résonateur céramique, montée d'alimentation lente)",
+          "2": "Démarrage 1CK, Reset 14CK (résonateur céramique, BOD activé)",
+          "3": "Démarrage 1CK, Reset 14CK + 4,1ms (résonateur céramique, montée d'alimentation rapide)",
+          "4": "Démarrage 1CK, Reset 14CK + 65ms (résonateur céramique, montée d'alimentation lente)",
+          "5": "Démarrage 16CK, Reset 14CK (Quartz, BOD activé)",
+          "6": "Démarrage 16CK, Reset 14CK + 4,1ms (Quartz, montée d'alimentation rapide)",
+          "7": "Démarrage 16CK, Reset 14CK + 65ms (Quartz, montée d'alimentation lente)"
+        }
+      },
+      {
+        "bits": [6],
+        "label": "Sortie horloge CKOUT",
+        "values": {
+          "0": "Sortie de l'horloge sur la pin CKOUT",
+          "1": "Pas de sortie de l'horloge"
+        }
+      },
+      {
+        "bits": [7],
+        "label": "Division horloge",
+        "values": {
+          "0": "Division de l'horloge par 8",
+          "1": "Pas de division de l'horloge"
+        }
+      }
+    ],
+    "high": [
+      {
+        "bits": [0],
+        "label": "Vecteur de reset",
+        "values": {
+          "0": "Vecteur reset vers le boot loader",
+          "1": "Vecteur reset vers l’application"
+        }
+      },
+      {
+        "bits": [1, 2],
+        "label": "Taille du bootloader",
+        "values": {
+          "0": "Bootloader 1024 mots – 0x1C00",
+          "1": "Bootloader 512 mots – 0x1E00",
+          "2": "Bootloader 256 mots – 0x1F00",
+          "3": "Bootloader 128 mots – 0x1F80"
+        }
+      },
+      {
+        "bits": [3],
+        "label": "Conservation EEPROM",
+        "values": {
+          "0": "EEPROM préservée lors de la réinitialisation du µC",
+          "1": "EEPROM effacée lors de la réinitialisation du µC"
+        }
+      },
+      {
+        "bits": [4],
+        "label": "Watchdog",
+        "values": {
+          "0": "Horloge watchdog toujours activée",
+          "1": "Horloge watchdog non activée"
+        }
+      },
+      {
+        "bits": [5],
+        "label": "Programmation série (SPI)",
+        "values": {
+          "0": "Activer le chargement des programmes et données via le port série",
+          "1": "Désactiver le chargement des programmes et données via le port série"
+        }
+      },
+      {
+        "bits": [6],
+        "label": "JTAG",
+        "values": {
+          "0": "Activer JTAG",
+          "1": "Désactiver JTAG"
+        }
+      },
+      {
+        "bits": [7],
+        "label": "OCD (On-Chip Debug)",
+        "values": {
+          "0": "Activer OCD",
+          "1": "Désactiver OCD"
+        }
+      }
+    ],
+    "ext": [
+      {
+        "bits": [0, 1, 2],
+        "label": "Niveau Brown-Out Detection",
+        "values": {
+          "4": "4,3 V",
+          "5": "2,7 V",
+          "6": "1,8 V",
+          "7": "Désactivé"
+        }
+      }
+    ],
+    "lock": [
+      {
+        "bits": [0, 1],
+        "label": "Protection mémoire",
+        "values": {
+          "0": "Programmation et lecture des mémoires Flash et EEPROM bloqués en mode Parallèle, JTAG et Série et programmation des Fuse bloquée en mode Parallèle et Série",
+          "2": "Programmation des mémoires Flash et EEPROM et la programmation des Fuse bloqués en mode Parallèle et Série",
+          "3": "Pas de blocage de lecture/programmation des mémoires Flash et EEPROM et des fuse"
+        }
+      },
+      {
+        "bits": [2, 3],
+        "label": "Protection Application",
+        "values": {
+          "0": "(E)LPM exécutée depuis la section Boot Loader est bloqué pour lire la section Application. Si les vecteurs d'interruption sont placés dans la section Boot Loader, les interruptions sont désactivées pendant l'exécution depuis la section Application.",
+          "1": "SPM est bloqué pour écrire dans la section Application, et (E)LPM exécutée depuis la section Boot Loader est bloqué pour lire la section Application. Si les vecteurs d'interruption sont placés dans la section Boot Loader, les interruptions sont désactivées pendant l'exécution depuis la section Application.",
+          "2": "SPM est bloqué pour l'écriture de la mémoire Application",
+          "3": "Pas de blocage SPM/(E)LPM pour l'accès à la section Application"
+        }
+      },
+      {
+        "bits": [4, 5],
+        "label": "Protection Boot Loader",
+        "values": {
+          "0": "(E)LPM exécutée depuis la section Boot Loader est bloqué pour lire la section Application. Si les vecteurs d'interruption sont placés dans la section Boot Loader, les interruptions sont désactivées pendant l'exécution depuis la section Application.",
+          "1": "SPM est bloqué pour écrire dans la section Boot Loader, et (E)LPM exécutée depuis la section application est bloqué pour lire la section Boot Loader. Si les vecteurs d'interruption sont placés dans la section Application, les interruptions sont désactivées pendant l'exécution depuis la section Boot Loader.",
+          "2": "SPM est bloqué pour l'écriture de la section Boot Loader",
+          "3": "Pas de blocage SPM/(E)LPM pour l'accès à la section Boot Loader"
+        }
+      }
+    ]
+  }
+}
