@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Callable, Optional, TypedDict
 
 # Debug messages control variable
-DEBUG_PRINT = True
+DEBUG_PRINT = False
 
 
 class ChipProperties(TypedDict):
@@ -40,12 +40,14 @@ class HVPPCommand(Enum):
     WRITE_MEMORY = 10
     LOG = 97
     END = 99
+    # Python-only operations (not sent to firmware)
+    VERIFY_MEMORY = 100
 
 
 class AtmelHighVoltageParallelProgrammer:
     """Class for communicating with HVPP programmer via serial port"""
 
-    BAUD_RATE = 57600
+    BAUD_RATE = 230400
 
     # Chip properties database
     CHIP_PROPERTIES: dict[str, ChipProperties] = {
@@ -183,6 +185,21 @@ class AtmelHighVoltageParallelProgrammer:
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
 
+    def _clear_input_buffer(self):
+        """Clear the serial input buffer to discard any pending data"""
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.reset_input_buffer()
+            if DEBUG_PRINT:
+                print("Input buffer cleared")
+
+    def _handle_operation_stop(self):
+        """Handle operation interruption: wait 5 seconds and clear input buffer"""
+        if DEBUG_PRINT:
+            print("Operation stopped - waiting 5 seconds...")
+        time.sleep(5.0)
+        self._clear_input_buffer()
+        raise RuntimeError("Operation stopped")
+
     def programmer_communicate(
         self,
         cmd: HVPPCommand,
@@ -223,23 +240,27 @@ class AtmelHighVoltageParallelProgrammer:
         elif cmd == HVPPCommand.READ_CALIBRATION_BYTE:
             result = self._send_command("08", "", 2)
         elif cmd == HVPPCommand.READ_MEMORY:
-            # Parameters format: "memory_type:filename"
+            # Parameters format: "memory_type:filename" or "memory_type:filename:num_pages"
             # memory_type: "flash" or "eeprom"
             # filename: path to output file
+            # num_pages: optional number of pages to read (default: all)
             if DEBUG_PRINT:
                 print(f"READ_MEMORY parameters: '{parameters}'")
-            parts = parameters.split(":", 1)
-            if len(parts) != 2:
-                raise ValueError("Invalid READ_MEMORY parameters. Expected format: 'flash:filename' or 'eeprom:filename'")
+            parts = parameters.split(":", 2)
+            if len(parts) < 2:
+                raise ValueError("Invalid READ_MEMORY parameters. Expected format: 'flash:filename' or 'flash:filename:num_pages'")
 
-            memory_type, filename = parts
+            memory_type = parts[0]
+            filename = parts[1]
+            num_pages = int(parts[2]) if len(parts) >= 3 else None
+
             if DEBUG_PRINT:
-                print(f"READ_MEMORY parsed -> memory_type='{memory_type}', filename='{filename}'")
+                print(f"READ_MEMORY parsed -> memory_type='{memory_type}', filename='{filename}', num_pages={num_pages}")
             if memory_type.lower() == "flash":
-                self._read_flash_memory(filename, progress_callback, stop_event)
+                self._read_flash_memory(filename, progress_callback, stop_event, num_pages)
                 result = "0"  # Success
             elif memory_type.lower() == "eeprom":
-                self._read_eeprom_memory(filename, progress_callback, stop_event)
+                self._read_eeprom_memory(filename, progress_callback, stop_event, num_pages)
                 result = "0"  # Success
             else:
                 raise ValueError(f"Unknown memory type: {memory_type}")
@@ -258,6 +279,23 @@ class AtmelHighVoltageParallelProgrammer:
                 result = self._write_flash_memory(filename, progress_callback, stop_event)
             elif memory_type.lower() == "eeprom":
                 result = self._write_eeprom_memory(filename, progress_callback, stop_event)
+            else:
+                raise ValueError(f"Unknown memory type: {memory_type}")
+        elif cmd == HVPPCommand.VERIFY_MEMORY:
+            # Parameters format: "memory_type:filename"
+            if DEBUG_PRINT:
+                print(f"VERIFY_MEMORY parameters: '{parameters}'")
+            parts = parameters.split(":", 1)
+            if len(parts) != 2:
+                raise ValueError("Invalid VERIFY_MEMORY parameters. Expected format: 'flash:filename' or 'eeprom:filename'")
+
+            memory_type, filename = parts
+            if DEBUG_PRINT:
+                print(f"VERIFY_MEMORY parsed -> memory_type='{memory_type}', filename='{filename}'")
+            if memory_type.lower() == "flash":
+                result = self._verify_flash_memory(filename, progress_callback, stop_event)
+            elif memory_type.lower() == "eeprom":
+                result = self._verify_eeprom_memory(filename, progress_callback, stop_event)
             else:
                 raise ValueError(f"Unknown memory type: {memory_type}")
         elif cmd == HVPPCommand.LOG:
@@ -385,9 +423,6 @@ class AtmelHighVoltageParallelProgrammer:
                         self.data_received_ready = True
                         if DEBUG_PRINT:
                             print(f"Complete data received: '{self.in_string}'")
-                # else:
-                #     if DEBUG_PRINT:
-                #         print("No data waiting")
         except Exception as ex:
             if DEBUG_PRINT:
                 print(f"ERROR in _read_data: {ex}")
@@ -431,7 +466,7 @@ class AtmelHighVoltageParallelProgrammer:
         cmd = f"09{page_size:02X}{page_number:04X}{memory_type:02X}"
 
         if stop_event and stop_event.is_set():
-            raise RuntimeError("Operation stopped")
+            self._handle_operation_stop()
 
         if DEBUG_PRINT:
             unit = "words" if memory_type == 0x01 else "bytes"
@@ -461,7 +496,7 @@ class AtmelHighVoltageParallelProgrammer:
 
         while len(data) < expected_bytes:
             if stop_event and stop_event.is_set():
-                raise RuntimeError("Operation stopped")
+                self._handle_operation_stop()
             if time.time() > timeout:
                 if DEBUG_PRINT:
                     print(
@@ -474,8 +509,6 @@ class AtmelHighVoltageParallelProgrammer:
                 data += chunk
                 if DEBUG_PRINT:
                     print(f"Received {len(chunk)} bytes, total: {len(data)}/{expected_bytes}")
-            elif DEBUG_PRINT:
-                print("No data waiting on serial port")
 
             time.sleep(0.01)
 
@@ -630,12 +663,14 @@ class AtmelHighVoltageParallelProgrammer:
         filename: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         stop_event: Optional[threading.Event] = None,
+        num_pages: Optional[int] = None,
     ) -> None:
         """
-        Read entire Flash memory and save to Intel HEX file
+        Read Flash memory and save to Intel HEX file
 
         Args:
             filename: Output file path
+            num_pages: Number of pages to read (default: all pages)
 
         Raises:
             RuntimeError: If read fails or CRC check fails
@@ -644,27 +679,31 @@ class AtmelHighVoltageParallelProgrammer:
         total_size = self.chip_props["flash_total_size"]
         total_pages = total_size // (page_size * 2)
 
+        # Use specified number of pages or default to all pages
+        pages_to_read = num_pages if num_pages is not None else total_pages
+        pages_to_read = min(pages_to_read, total_pages)  # Ensure not exceeding total
+
         if DEBUG_PRINT:
             print(
-                f"Reading Flash: page_size={page_size} words, total_pages={total_pages}, "
+                f"Reading Flash: page_size={page_size} words, pages_to_read={pages_to_read}/{total_pages}, "
                 f"total_size={total_size} bytes, output='{filename}'"
             )
 
-        # Read all pages
+        # Read specified number of pages
         if progress_callback:
-            progress_callback(0, total_pages)
+            progress_callback(0, pages_to_read)
         all_data = bytearray()
-        for page_num in range(total_pages):
+        for page_num in range(pages_to_read):
             if stop_event and stop_event.is_set():
-                raise RuntimeError("Operation stopped")
+                self._handle_operation_stop()
             page_data = self._read_memory_page(page_size, page_num, 0x01, stop_event)  # 0x01 = Flash
             all_data.extend(page_data)
 
             if progress_callback:
-                progress_callback(page_num + 1, total_pages)
+                progress_callback(page_num + 1, pages_to_read)
 
             if DEBUG_PRINT:
-                print(f"Read Flash page {page_num + 1}/{total_pages}")
+                print(f"Read Flash page {page_num + 1}/{pages_to_read}")
 
         # Write to Intel HEX file
         if DEBUG_PRINT:
@@ -678,12 +717,14 @@ class AtmelHighVoltageParallelProgrammer:
         filename: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         stop_event: Optional[threading.Event] = None,
+        num_pages: Optional[int] = None,
     ) -> None:
         """
-        Read entire EEPROM memory and save to Intel HEX file
+        Read EEPROM memory and save to Intel HEX file
 
         Args:
             filename: Output file path
+            num_pages: Number of pages to read (default: all pages)
 
         Raises:
             RuntimeError: If read fails or CRC check fails
@@ -692,27 +733,31 @@ class AtmelHighVoltageParallelProgrammer:
         total_size = self.chip_props["eeprom_total_size"]
         total_pages = total_size // page_size
 
+        # Use specified number of pages or default to all pages
+        pages_to_read = num_pages if num_pages is not None else total_pages
+        pages_to_read = min(pages_to_read, total_pages)  # Ensure not exceeding total
+
         if DEBUG_PRINT:
             print(
-                f"Reading EEPROM: page_size={page_size}, total_pages={total_pages}, "
+                f"Reading EEPROM: page_size={page_size}, pages_to_read={pages_to_read}/{total_pages}, "
                 f"total_size={total_size}, output='{filename}'"
             )
 
-        # Read all pages
+        # Read specified number of pages
         if progress_callback:
-            progress_callback(0, total_pages)
+            progress_callback(0, pages_to_read)
         all_data = bytearray()
-        for page_num in range(total_pages):
+        for page_num in range(pages_to_read):
             if stop_event and stop_event.is_set():
-                raise RuntimeError("Operation stopped")
+                self._handle_operation_stop()
             page_data = self._read_memory_page(page_size, page_num, 0x02, stop_event)  # 0x02 = EEPROM
             all_data.extend(page_data)
 
             if progress_callback:
-                progress_callback(page_num + 1, total_pages)
+                progress_callback(page_num + 1, pages_to_read)
 
             if DEBUG_PRINT:
-                print(f"Read EEPROM page {page_num + 1}/{total_pages}")
+                print(f"Read EEPROM page {page_num + 1}/{pages_to_read}")
 
         # Write to Intel HEX file
         if DEBUG_PRINT:
@@ -720,6 +765,154 @@ class AtmelHighVoltageParallelProgrammer:
         self._write_intel_hex(filename, all_data)
         if DEBUG_PRINT:
             print("EEPROM read completed successfully")
+
+    def _verify_memory(
+        self,
+        filename: str,
+        page_size: int,
+        page_bytes: int,
+        memory_type: int,
+        memory_label: str,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> str:
+        """
+        Generic memory verification against an Intel HEX file
+
+        Args:
+            filename: HEX file path to compare against
+            page_size: Page size (in units - words for Flash, bytes for EEPROM)
+            page_bytes: Page size in bytes
+            memory_type: Memory type (0x01 for Flash, 0x02 for EEPROM)
+            memory_label: Label for debug messages ("Flash" or "EEPROM")
+            progress_callback: Optional progress callback
+            stop_event: Optional stop event
+
+        Returns:
+            "0" on success, error message on verification failure
+        """
+        if DEBUG_PRINT:
+            print(f"Verifying {memory_label} from file: '{filename}'")
+
+        # Parse HEX file to get expected data
+        expected_memory = self._parse_intel_hex(filename)
+        if not expected_memory:
+            return "1 HEX file contains no data"
+
+        # Determine which pages need to be read
+        addresses = list(expected_memory.keys())
+        min_addr = min(addresses)
+        max_addr = max(addresses)
+
+        first_page = min_addr // page_bytes
+        last_page = max_addr // page_bytes
+        total_pages = last_page - first_page + 1
+
+        if DEBUG_PRINT:
+            print(f"Verification: pages {first_page} to {last_page} ({total_pages} pages)")
+
+        if progress_callback:
+            progress_callback(0, total_pages)
+
+        # Read and verify each page
+        mismatches = []
+        for page_index, page_num in enumerate(range(first_page, last_page + 1)):
+            if stop_event and stop_event.is_set():
+                self._handle_operation_stop()
+
+            # Read page from microcontroller
+            page_data = self._read_memory_page(page_size, page_num, memory_type, stop_event)
+
+            # Verify bytes that are defined in the HEX file
+            page_start_addr = page_num * page_bytes
+            for offset in range(len(page_data)):
+                addr = page_start_addr + offset
+                if addr in expected_memory:
+                    expected_byte = expected_memory[addr]
+                    actual_byte = page_data[offset]
+                    if expected_byte != actual_byte:
+                        mismatches.append(
+                            f"0x{addr:06X}: expected 0x{expected_byte:02X}, got 0x{actual_byte:02X}"
+                        )
+                        if len(mismatches) >= 10:  # Limit error reporting
+                            break
+
+            if progress_callback:
+                progress_callback(page_index + 1, total_pages)
+
+            if len(mismatches) >= 10:
+                break
+
+            if DEBUG_PRINT:
+                print(f"Verified {memory_label} page {page_num} ({page_index + 1}/{total_pages})")
+
+        if mismatches:
+            error_summary = f"Verification failed with {len(mismatches)} mismatch(es)"
+            if DEBUG_PRINT:
+                print(error_summary)
+                for err in mismatches[:5]:  # Print first 5
+                    print(f"  {err}")
+            return f"1 {error_summary}: {mismatches[0]}"
+
+        if DEBUG_PRINT:
+            print(f"{memory_label} verification completed successfully")
+        return "0"
+
+    def _verify_flash_memory(
+        self,
+        filename: str,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> str:
+        """
+        Verify Flash memory against an Intel HEX file
+
+        Args:
+            filename: HEX file path to compare against
+
+        Returns:
+            "0" on success, error message on verification failure
+        """
+        page_size = self.chip_props["flash_page_size"]
+        page_bytes = page_size * 2  # Flash is in words (2 bytes each)
+
+        return self._verify_memory(
+            filename=filename,
+            page_size=page_size,
+            page_bytes=page_bytes,
+            memory_type=0x01,  # Flash
+            memory_label="Flash",
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+        )
+
+    def _verify_eeprom_memory(
+        self,
+        filename: str,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> str:
+        """
+        Verify EEPROM memory against an Intel HEX file
+
+        Args:
+            filename: HEX file path to compare against
+
+        Returns:
+            "0" on success, error message on verification failure
+        """
+        page_size = self.chip_props["eeprom_page_size"]
+        page_bytes = page_size  # EEPROM is in bytes
+
+        return self._verify_memory(
+            filename=filename,
+            page_size=page_size,
+            page_bytes=page_bytes,
+            memory_type=0x02,  # EEPROM
+            memory_label="EEPROM",
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+        )
 
     def _write_flash_memory(
         self,
@@ -814,7 +1007,7 @@ class AtmelHighVoltageParallelProgrammer:
 
         for page_index, (page_number, values) in enumerate(sorted(pages.items())):
             if stop_event and stop_event.is_set():
-                raise RuntimeError("Operation stopped")
+                self._handle_operation_stop()
 
             segments = self._segment_page_data(page_bytes, list(values.keys()), values)
             for offset, data in segments:
@@ -835,6 +1028,17 @@ class AtmelHighVoltageParallelProgrammer:
 
         return "0"  # Success
 
+    def _get_unit_size(self, memory_type: int) -> int:
+        """Retourne la taille unitaire (1 pour octets, 2 pour mots) selon le type de mémoire.
+
+        Args:
+            memory_type: 0x01 pour Flash (mots de 16 bits), 0x02 pour EEPROM (octets)
+
+        Returns:
+            2 pour Flash (mots), 1 pour EEPROM (octets)
+        """
+        return 2 if memory_type == 0x01 else 1
+
     def _write_memory_page(
         self,
         page_size: int,
@@ -848,26 +1052,29 @@ class AtmelHighVoltageParallelProgrammer:
         Returns:
             "0" on success, or firmware error response (e.g., "1 Checksum invalide...")
         """
-        if offset + len(data) > (page_size * 2 if memory_type == 0x01 else page_size):
+        unit_size = self._get_unit_size(memory_type)
+
+        if offset + len(data) > page_size * unit_size:
             raise RuntimeError("Offset + length exceeds page size")
 
         if len(data) == 0:
             return "0"  # No data to write, return success
 
         # Command format: 10ssppppttooll
-        # For Flash, firmware expects length in words; for EEPROM, in bytes
-        write_length = len(data) // 2 if memory_type == 0x01 else len(data)
+        # CORRECTION: offset et length doivent être en unités (mots pour Flash, octets pour EEPROM)
+        firmware_offset = offset // unit_size
+        write_length = len(data) // unit_size
 
-        if offset > 0xFF or write_length > 0xFF:
+        if firmware_offset > 0xFF or write_length > 0xFF:
             raise RuntimeError("Offset/length must fit in one byte")
 
-        cmd = f"10{page_size:02X}{page_number:04X}{memory_type:02X}{offset:02X}{write_length:02X}"
+        cmd = f"10{page_size:02X}{page_number:04X}{memory_type:02X}{firmware_offset:02X}{write_length:02X}"
 
         if DEBUG_PRINT:
             unit = "words" if memory_type == 0x01 else "bytes"
             print(
                 f"Writing memory page: cmd={cmd} (page_size={page_size} {unit}, page={page_number}, "
-                f"offset={offset}, length={write_length} {unit}, data_bytes={len(data)})"
+                f"offset={offset} bytes -> {firmware_offset} {unit}, length={write_length} {unit}, data_bytes={len(data)})"
             )
 
         self._send_data(cmd)

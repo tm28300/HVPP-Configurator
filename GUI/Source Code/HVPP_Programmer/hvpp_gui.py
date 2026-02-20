@@ -8,7 +8,7 @@ import sys
 import threading
 import json
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from pathlib import Path
 from typing import Optional, Callable, Union
 from hvpp_programmer import AtmelHighVoltageParallelProgrammer, HVPPCommand
@@ -265,7 +265,8 @@ class HVPPConfiguratorGUI:
         success_message: str,
         error_context: str = "",
         success_title: str = "Information",
-        generic_error: str = "Error communicating with the programmer."
+        generic_error: str = "Error communicating with the programmer.",
+        use_toast: bool = False
     ) -> bool:
         """
         Handle programmer response: parse it and show appropriate message
@@ -276,15 +277,23 @@ class HVPPConfiguratorGUI:
             error_context: Context for error message (e.g., "write low fuse")
             success_title: Title for success dialog ("Information" or "Success")
             generic_error: Generic error message if no specific error from programmer
+            use_toast: If True, show success as toast notification instead of messagebox
 
         Returns:
             True if success, False otherwise
         """
         success, error_msg = self._parse_programmer_response(result)
         if success:
-            messagebox.showinfo(success_title, success_message)
+            if use_toast:
+                self._show_toast(success_message, bg_color="#4CAF50")
+            else:
+                messagebox.showinfo(success_title, success_message)
             return True
         else:
+            # Clear input buffer on error
+            if self.programmer:
+                self.programmer._clear_input_buffer()
+
             box_details: str
             if error_msg:
                 if error_context:
@@ -337,6 +346,7 @@ class HVPPConfiguratorGUI:
         self._stop_event = threading.Event()
         self._busy = False
         self._is_connected = False  # Track connection state
+        self._toast_timer = None  # Timer for toast notifications
 
         self._create_widgets()
         self._load_ports()
@@ -351,6 +361,20 @@ class HVPPConfiguratorGUI:
 
     def _create_widgets(self):
         """Create all GUI widgets"""
+
+        # ===== Toast Notification Container (hidden by default) =====
+        self.toast_frame = tk.Frame(self.root, bg="#4CAF50", relief=tk.RAISED, borderwidth=2)
+        self.toast_label = tk.Label(
+            self.toast_frame,
+            text="",
+            bg="#4CAF50",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=20,
+            pady=8
+        )
+        self.toast_label.pack()
+        # Toast is not gridded yet, will be shown when needed
 
         # ===== Menu Bar =====
         menubar = tk.Menu(self.root)
@@ -387,18 +411,23 @@ class HVPPConfiguratorGUI:
         self.port_combo = ttk.Combobox(chip_frame, state="readonly", width=10)
         self.port_combo.grid(row=0, column=3, padx=5)
 
+        # Refresh Ports button
+        self.refresh_ports_btn = ttk.Button(chip_frame, text="⟳", width=3, command=self._on_refresh_ports)
+        self.refresh_ports_btn.grid(row=0, column=4, padx=(0, 5))
+        ToolTip(self.refresh_ports_btn, "Actualiser la liste des ports série")
+
         # Connect button
         self.connect_btn = ttk.Button(chip_frame, text="Connect", command=self._on_connect)
-        self.connect_btn.grid(row=0, column=4, padx=5)
+        self.connect_btn.grid(row=0, column=5, padx=5)
 
         # Chip Signature
-        ttk.Label(chip_frame, text="Chip Signature:").grid(row=0, column=5, sticky="w", padx=5)
+        ttk.Label(chip_frame, text="Chip Signature:").grid(row=0, column=6, sticky="w", padx=5)
         self.signature_entry = ttk.Entry(chip_frame, width=12, justify="center")
-        self.signature_entry.grid(row=0, column=6, padx=5)
+        self.signature_entry.grid(row=0, column=7, padx=5)
 
         # Read Signature button
         self.read_sig_btn = ttk.Button(chip_frame, text="Read Signature", command=self._on_read_signature)
-        self.read_sig_btn.grid(row=0, column=7, padx=5)
+        self.read_sig_btn.grid(row=0, column=8, padx=5)
 
         # ===== Chip Functions Section =====
         func_frame = ttk.LabelFrame(self.root, text="Chip Functions", padding=10)
@@ -471,30 +500,37 @@ class HVPPConfiguratorGUI:
         memory_frame = ttk.LabelFrame(self.root, text="Memory Operations", padding=10)
         memory_frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
 
-        # Flash memory buttons
+        # Flash memory buttons (column 0-1)
         self.read_flash_btn = ttk.Button(memory_frame, text="Read Flash Memory", command=self._on_read_flash)
         self.read_flash_btn.grid(row=0, column=0, padx=5, pady=5)
 
         self.write_flash_btn = ttk.Button(memory_frame, text="Write Flash Memory", command=self._on_write_flash)
         self.write_flash_btn.grid(row=0, column=1, padx=5, pady=5)
 
-        # EEPROM memory buttons
+        self.verify_flash_btn = ttk.Button(memory_frame, text="Verify Flash Memory", command=self._on_verify_flash)
+        self.verify_flash_btn.grid(row=1, column=1, padx=5, pady=5)
+
+        # EEPROM memory buttons (column 2-3)
         self.read_eeprom_btn = ttk.Button(memory_frame, text="Read EEPROM Memory", command=self._on_read_eeprom)
         self.read_eeprom_btn.grid(row=0, column=2, padx=5, pady=5)
 
         self.write_eeprom_btn = ttk.Button(memory_frame, text="Write EEPROM Memory", command=self._on_write_eeprom)
         self.write_eeprom_btn.grid(row=0, column=3, padx=5, pady=5)
 
+        self.verify_eeprom_btn = ttk.Button(memory_frame, text="Verify EEPROM Memory", command=self._on_verify_eeprom)
+        self.verify_eeprom_btn.grid(row=1, column=3, padx=5, pady=5)
+
+        # Stop button
         self.stop_btn = ttk.Button(memory_frame, text="Stop", command=self._on_stop, state="disabled")
         self.stop_btn.grid(row=0, column=4, padx=5, pady=5)
 
         # Progress bar for memory operations
         self.progress_bar = ttk.Progressbar(memory_frame, orient="horizontal", mode="determinate", length=300)
-        self.progress_bar.grid(row=1, column=0, columnspan=5, sticky="ew", padx=5, pady=(5, 0))
+        self.progress_bar.grid(row=2, column=0, columnspan=5, sticky="ew", padx=5, pady=(5, 0))
         self.operation_label = ttk.Label(memory_frame, text="")
-        self.operation_label.grid(row=2, column=0, columnspan=5, sticky="w", padx=5, pady=(0, 2))
+        self.operation_label.grid(row=3, column=0, columnspan=5, sticky="w", padx=5, pady=(0, 2))
         self.progress_label = ttk.Label(memory_frame, text="")
-        self.progress_label.grid(row=3, column=0, columnspan=5, sticky="w", padx=5, pady=(0, 5))
+        self.progress_label.grid(row=4, column=0, columnspan=5, sticky="w", padx=5, pady=(0, 5))
 
         # ===== Bottom Buttons =====
         button_frame = ttk.Frame(self.root)
@@ -513,50 +549,134 @@ class HVPPConfiguratorGUI:
         if ports:
             self.port_combo.current(0)
 
+    def _on_refresh_ports(self):
+        """Refresh the list of available serial ports"""
+        current_selection = self.port_combo.get()
+        self._load_ports()
+
+        # Try to restore previous selection if still available
+        if current_selection in self.port_combo['values']:
+            self.port_combo.set(current_selection)
+
+        # Show brief feedback
+        original_text = self.refresh_ports_btn.cget("text")
+        self.refresh_ports_btn.config(text="✓")
+        self.root.after(500, lambda: self.refresh_ports_btn.config(text=original_text))
+
     def _init_busy_widgets(self):
-        """Track widgets that should be disabled during background operations."""
-        self._busy_widgets = [
-            self.chip_combo,
-            self.port_combo,
-            self.connect_btn,
-            self.read_sig_btn,
-            self.read_cal_btn,
-            self.erase_btn,
-            self.lock_btn,
-            self.read_fuses_btn,
-            self.write_lfuse_btn,
-            self.write_hfuse_btn,
-            self.write_efuse_btn,
-            self.disconnect_btn,
-            self.read_flash_btn,
-            self.write_flash_btn,
-            self.read_eeprom_btn,
-            self.write_eeprom_btn,
-        ]
-        self._busy_widget_states = {widget: widget.cget("state") for widget in self._busy_widgets}
+        """Initialize widget tracking (kept for compatibility but no longer used)."""
+        # This method is kept for compatibility but widget state management
+        # is now handled by _update_connection_state() and _set_controls_busy()
+        pass
+
+    def _set_connection_controls(self, enabled: bool):
+        """Enable or disable connection interface controls.
+
+        Args:
+            enabled: True to enable controls, False to disable
+        """
+        state = "readonly" if enabled else "disabled"
+        self.chip_combo.config(state=state)
+        self.port_combo.config(state=state)
+
+        btn_state = "normal" if enabled else "disabled"
+        self.refresh_ports_btn.config(state=btn_state)
+        self.connect_btn.config(state=btn_state)
+
+    def _set_operation_controls(self, enabled: bool):
+        """Enable or disable programmer operation controls.
+
+        Args:
+            enabled: True to enable controls, False to disable
+        """
+        state = "normal" if enabled else "disabled"
+
+        # Programmer operation buttons
+        self.disconnect_btn.config(state=state)
+        self.read_sig_btn.config(state=state)
+        self.read_cal_btn.config(state=state)
+        self.erase_btn.config(state=state)
+        self.lock_btn.config(state=state)
+        self.read_fuses_btn.config(state=state)
+        self.write_lfuse_btn.config(state=state)
+        self.write_hfuse_btn.config(state=state)
+        self.write_efuse_btn.config(state=state)
+
+        # Memory operation buttons
+        self.read_flash_btn.config(state=state)
+        self.write_flash_btn.config(state=state)
+        self.verify_flash_btn.config(state=state)
+        self.read_eeprom_btn.config(state=state)
+        self.write_eeprom_btn.config(state=state)
+        self.verify_eeprom_btn.config(state=state)
 
     def _set_controls_busy(self, busy: bool):
         """Enable/disable controls during long-running operations."""
-        for widget in self._busy_widgets:
-            if busy:
-                widget.config(state="disabled")
-            else:
-                original_state = self._busy_widget_states.get(widget, "normal")
-                widget.config(state=original_state)
-
         if busy:
+            # Disable all controls
+            self._set_connection_controls(False)
+            self._set_operation_controls(False)
             self.log_menu_item.entryconfig(self.log_menu_index, state="disabled")
             self.stop_btn.config(state="normal")
         else:
-            if self.programmer:
-                self.log_menu_item.entryconfig(self.log_menu_index, state="normal")
+            # Restore state based on connection status
             self.stop_btn.config(state="disabled")
+            self._update_connection_state(self._is_connected)
 
     def _clear_progress(self):
         """Clear progress bar and labels."""
         self.progress_bar["value"] = 0
         self.operation_label.config(text="")
         self.progress_label.config(text="")
+
+    def _clear_data_fields(self):
+        """Clear all data display fields (signature, calibration, fuses, lock)"""
+        self.signature_entry.delete(0, tk.END)
+        self.calibration_entry.delete(0, tk.END)
+        self.lfuse_entry.delete(0, tk.END)
+        self.hfuse_entry.delete(0, tk.END)
+        self.efuse_entry.delete(0, tk.END)
+        self.lock_entry.delete(0, tk.END)
+
+    def _show_toast(self, message: str, bg_color: str = "#4CAF50", duration: int = 5000):
+        """
+        Display a temporary toast notification at the top of the window
+
+        Args:
+            message: Message to display
+            bg_color: Background color (default: green #4CAF50 for success)
+            duration: Duration in milliseconds (default: 5000ms = 5 seconds)
+        """
+        # Cancel any existing timer
+        if self._toast_timer:
+            self.root.after_cancel(self._toast_timer)
+
+        # Update toast appearance
+        self.toast_frame.config(bg=bg_color)
+        self.toast_label.config(text=message, bg=bg_color, fg="white")
+
+        # Force widget update to calculate proper size
+        self.toast_frame.update_idletasks()
+
+        # Show toast at top center using place (overlay)
+        self.root.update_idletasks()  # Update to get proper window dimensions
+
+        # Position at top right, below the menu bar (10 pixels from top, 10 pixels from right)
+        self.toast_frame.place(relx=1.0, y=10, anchor="ne", x=-10)
+
+        # Raise toast above all other widgets
+        self.toast_frame.lift()
+
+        # Force display update
+        self.root.update()
+
+        # Schedule auto-hide
+        self._toast_timer = self.root.after(duration, self._hide_toast)
+
+    def _hide_toast(self):
+        """Hide the toast notification"""
+        self.toast_frame.place_forget()
+        self._toast_timer = None
 
     def _update_connection_state(self, connected: bool):
         """
@@ -568,45 +688,22 @@ class HVPPConfiguratorGUI:
         self._is_connected = connected
 
         if connected:
-            # Disable connection controls
-            self.chip_combo.config(state="disabled")
-            self.port_combo.config(state="disabled")
-            self.connect_btn.config(state="disabled")
+            # Enable Programmer Log menu option
+            self.log_menu_item.entryconfig(self.log_menu_index, state="normal")
 
-            # Enable programmer operation buttons
-            self.disconnect_btn.config(state="normal")
-            self.read_sig_btn.config(state="normal")
-            self.read_cal_btn.config(state="normal")
-            self.erase_btn.config(state="normal")
-            self.lock_btn.config(state="normal")
-            self.read_fuses_btn.config(state="normal")
-            self.write_lfuse_btn.config(state="normal")
-            self.write_hfuse_btn.config(state="normal")
-            self.write_efuse_btn.config(state="normal")
-            self.read_flash_btn.config(state="normal")
-            self.write_flash_btn.config(state="normal")
-            self.read_eeprom_btn.config(state="normal")
-            self.write_eeprom_btn.config(state="normal")
+            # Disable connection controls, enable operation controls
+            self._set_connection_controls(False)
+            self._set_operation_controls(True)
         else:
-            # Enable connection controls
-            self.chip_combo.config(state="readonly")
-            self.port_combo.config(state="readonly")
-            self.connect_btn.config(state="normal")
+            # Disable Programmer Log menu option
+            self.log_menu_item.entryconfig(self.log_menu_index, state="disabled")
 
-            # Disable all programmer operation buttons
-            self.disconnect_btn.config(state="disabled")
-            self.read_sig_btn.config(state="disabled")
-            self.read_cal_btn.config(state="disabled")
-            self.erase_btn.config(state="disabled")
-            self.lock_btn.config(state="disabled")
-            self.read_fuses_btn.config(state="disabled")
-            self.write_lfuse_btn.config(state="disabled")
-            self.write_hfuse_btn.config(state="disabled")
-            self.write_efuse_btn.config(state="disabled")
-            self.read_flash_btn.config(state="disabled")
-            self.write_flash_btn.config(state="disabled")
-            self.read_eeprom_btn.config(state="disabled")
-            self.write_eeprom_btn.config(state="disabled")
+            # Clear all data fields
+            self._clear_data_fields()
+
+            # Enable connection controls, disable operation controls
+            self._set_connection_controls(True)
+            self._set_operation_controls(False)
 
     def _handle_disconnection(self):
         """Handle programmer disconnection (e.g., cable unplugged, port unavailable)"""
@@ -617,14 +714,11 @@ class HVPPConfiguratorGUI:
                 pass
             self.programmer = None
 
-        # Disable Programmer Log option
-        self.log_menu_item.entryconfig(self.log_menu_index, state="disabled")
-
-        # Update to disconnected state
+        # Update to disconnected state (includes menu, fields clearing, and buttons)
         self._update_connection_state(False)
 
         messagebox.showerror("Connection Lost",
-            "Connection to the programmer has been lost.\\n\\nPlease check the cable and reconnect.")
+            "Connection to the programmer has been lost.\n\nPlease check the cable and reconnect.")
 
     def _on_connect(self):
         """Handle Connect button click"""
@@ -641,17 +735,16 @@ class HVPPConfiguratorGUI:
                 self.programmer.close()
 
             self.programmer = AtmelHighVoltageParallelProgrammer(port, chip)
-            # Enable Programmer Log option upon object creation
-            self.log_menu_item.entryconfig(self.log_menu_index, state="normal")
 
             result = self.programmer.programmer_communicate(HVPPCommand.OPEN, "")
 
             if self._handle_programmer_response(
                 result,
-                "HVPP mode has been enabled successfully.",
-                error_context="enable HVPP mode"
+                "✓ HVPP mode enabled successfully",
+                error_context="enable HVPP mode",
+                use_toast=True
             ):
-                # Update to connected state
+                # Update to connected state (includes enabling Programmer Log menu)
                 self._update_connection_state(True)
         except serial.SerialException as e:
             # Port already in use or unavailable
@@ -696,26 +789,19 @@ class HVPPConfiguratorGUI:
     def _on_disconnect(self):
         """Handle Disconnect button click"""
         if self.programmer:
-            result = self.programmer.programmer_communicate(HVPPCommand.END, "")
+            try:
+                result = self.programmer.programmer_communicate(HVPPCommand.END, "")
+                self._handle_programmer_response(
+                    result,
+                    "HVPP mode has ended successfully.",
+                    error_context="end HVPP mode"
+                )
+            except serial.SerialException:
+                # Connection already lost, no need to show error
+                pass
 
-            if self._handle_programmer_response(
-                result,
-                "HVPP mode has ended successfully.",
-                error_context="end HVPP mode"
-            ):
-                # Disable Programmer Log option
-                self.log_menu_item.entryconfig(self.log_menu_index, state="disabled")
-
-                # Clear all displayed data
-                self.signature_entry.delete(0, tk.END)
-                self.calibration_entry.delete(0, tk.END)
-                self.lfuse_entry.delete(0, tk.END)
-                self.hfuse_entry.delete(0, tk.END)
-                self.efuse_entry.delete(0, tk.END)
-                self.lock_entry.delete(0, tk.END)
-
-                # Update to disconnected state
-                self._update_connection_state(False)
+            # Update to disconnected state (includes menu, fields clearing, and buttons)
+            self._update_connection_state(False)
 
     def _on_read_fuses(self):
         """Handle Read Fuses button click"""
@@ -756,9 +842,12 @@ class HVPPConfiguratorGUI:
             messagebox.showwarning("Warning", "Please connect to the programmer first.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.READ_CALIBRATION_BYTE, "")
-        self.calibration_entry.delete(0, tk.END)
-        self.calibration_entry.insert(0, result)
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.READ_CALIBRATION_BYTE, "")
+            self.calibration_entry.delete(0, tk.END)
+            self.calibration_entry.insert(0, result)
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_write_lfuse(self):
         """Handle Write Low Fuse button click"""
@@ -771,13 +860,16 @@ class HVPPConfiguratorGUI:
             messagebox.showerror("Error", "Low fuse cannot be empty.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.WRITE_LFUSE, lfuse)
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.WRITE_LFUSE, lfuse)
 
-        self._handle_programmer_response(
-            result,
-            "Low fuse has been saved successfully.",
-            error_context="write low fuse"
-        )
+            self._handle_programmer_response(
+                result,
+                "Low fuse has been saved successfully.",
+                error_context="write low fuse"
+            )
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_write_hfuse(self):
         """Handle Write High Fuse button click"""
@@ -790,13 +882,16 @@ class HVPPConfiguratorGUI:
             messagebox.showerror("Error", "High fuse cannot be empty.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.WRITE_HFUSE, hfuse)
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.WRITE_HFUSE, hfuse)
 
-        self._handle_programmer_response(
-            result,
-            "High fuse has been saved successfully.",
-            error_context="write high fuse"
-        )
+            self._handle_programmer_response(
+                result,
+                "High fuse has been saved successfully.",
+                error_context="write high fuse"
+            )
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_write_efuse(self):
         """Handle Write Extended Fuse button click"""
@@ -809,13 +904,16 @@ class HVPPConfiguratorGUI:
             messagebox.showerror("Error", "Extended fuse cannot be empty.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.WRITE_EXT_FUSE, efuse)
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.WRITE_EXT_FUSE, efuse)
 
-        self._handle_programmer_response(
-            result,
-            "Extended fuse has been saved successfully.",
-            error_context="write extended fuse"
-        )
+            self._handle_programmer_response(
+                result,
+                "Extended fuse has been saved successfully.",
+                error_context="write extended fuse"
+            )
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_erase_chip(self):
         """Handle Erase Chip button click"""
@@ -823,13 +921,16 @@ class HVPPConfiguratorGUI:
             messagebox.showwarning("Warning", "Please connect to the programmer first.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.CHIP_ERASE, "")
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.CHIP_ERASE, "")
 
-        self._handle_programmer_response(
-            result,
-            "Chip has been erased successfully.",
-            error_context="erase chip"
-        )
+            self._handle_programmer_response(
+                result,
+                "Chip has been erased successfully.",
+                error_context="erase chip"
+            )
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_write_lock(self):
         """Handle Write Lock Byte button click"""
@@ -837,13 +938,16 @@ class HVPPConfiguratorGUI:
             messagebox.showwarning("Warning", "Please connect to the programmer first.")
             return
 
-        result = self.programmer.programmer_communicate(HVPPCommand.WRITE_LOCK_BYTE, "")
+        try:
+            result = self.programmer.programmer_communicate(HVPPCommand.WRITE_LOCK_BYTE, "")
 
-        self._handle_programmer_response(
-            result,
-            "Lock byte has been saved successfully.",
-            error_context="write lock byte"
-        )
+            self._handle_programmer_response(
+                result,
+                "Lock byte has been saved successfully.",
+                error_context="write lock byte"
+            )
+        except serial.SerialException:
+            self._handle_disconnection()
 
     def _on_log_programmer(self):
         """Handle Programmer Log menu option"""
@@ -874,6 +978,8 @@ class HVPPConfiguratorGUI:
             ok_btn = ttk.Button(log_window, text="OK", command=log_window.destroy)
             ok_btn.pack(pady=5)
 
+        except serial.SerialException:
+            self._handle_disconnection()
         except Exception as e:
             messagebox.showerror("Error", f"Error reading log: {str(e)}")
 
@@ -907,8 +1013,18 @@ class HVPPConfiguratorGUI:
         filename: str,
         success_message: str,
         hvpp_command: HVPPCommand = HVPPCommand.READ_MEMORY,
+        auto_verify: bool = False,
     ):
-        """Start memory operation in a background thread."""
+        """Start memory operation in a background thread.
+
+        Args:
+            label: Operation label to display
+            command: Command string to send
+            filename: File path (for display/verification)
+            success_message: Message on success
+            hvpp_command: HVPP command type
+            auto_verify: If True and write succeeds, automatically verify
+        """
         if self._operation_thread and self._operation_thread.is_alive():
             return
 
@@ -928,7 +1044,17 @@ class HVPPConfiguratorGUI:
             self._busy = False
 
             if error:
+                # Check if it's a serial disconnection
+                if isinstance(error, serial.SerialException):
+                    self._handle_disconnection()
+                    self._clear_progress()
+                    return
+
                 if str(error) != "Operation stopped":
+                    # Clear input buffer for any error (except operation stopped which already cleared it)
+                    if self.programmer:
+                        self.programmer._clear_input_buffer()
+
                     # Check if error message is a firmware response (starts with "0" or "1")
                     error_msg = str(error)
                     if error_msg and (error_msg.startswith("0") or error_msg.startswith("1")):
@@ -946,7 +1072,8 @@ class HVPPConfiguratorGUI:
                 self._clear_progress()
                 return
 
-            self._handle_programmer_response(
+            # Check if operation succeeded
+            success = self._handle_programmer_response(
                 result,
                 success_message,
                 error_context=label,
@@ -954,6 +1081,23 @@ class HVPPConfiguratorGUI:
                 generic_error=f"{label} failed."
             )
             self._clear_progress()
+
+            # Auto-verify after successful write
+            if success and auto_verify and hvpp_command == HVPPCommand.WRITE_MEMORY:
+                # Extract memory type from command (format: "memory_type:filename")
+                memory_type = command.split(":", 1)[0]
+                # Normalize memory type name (Flash or EEPROM)
+                memory_name = "Flash" if memory_type.lower() == "flash" else "EEPROM"
+                verify_label = f"Vérification {memory_name}"
+
+                self.root.after(500, lambda: self._start_memory_operation(
+                    label=verify_label,
+                    command=command,
+                    filename=filename,
+                    success_message=f"{memory_name} memory verification successful after write!",
+                    hvpp_command=HVPPCommand.VERIFY_MEMORY,
+                    auto_verify=False,  # Don't verify the verification!
+                ))
 
         def worker():
             try:
@@ -993,9 +1137,27 @@ class HVPPConfiguratorGUI:
         if not filename:
             return  # User cancelled
 
+        # Calculate total pages for Flash
+        page_size = self.programmer.chip_props["flash_page_size"]
+        total_size = self.programmer.chip_props["flash_total_size"]
+        total_pages = total_size // (page_size * 2)
+
+        # Ask user for number of pages to read
+        num_pages = simpledialog.askinteger(
+            "Nombre de pages",
+            f"Nombre de pages à lire (1-{total_pages}):",
+            initialvalue=total_pages,
+            minvalue=1,
+            maxvalue=total_pages,
+            parent=self.root
+        )
+
+        if num_pages is None:
+            return  # User cancelled
+
         self._start_memory_operation(
             label="Lecture Flash",
-            command=f"flash:{filename}",
+            command=f"flash:{filename}:{num_pages}",
             filename=filename,
             success_message=f"Flash memory successfully read and saved to:\n{filename}",
             hvpp_command=HVPPCommand.READ_MEMORY,
@@ -1017,9 +1179,27 @@ class HVPPConfiguratorGUI:
         if not filename:
             return  # User cancelled
 
+        # Calculate total pages for EEPROM
+        page_size = self.programmer.chip_props["eeprom_page_size"]
+        total_size = self.programmer.chip_props["eeprom_total_size"]
+        total_pages = total_size // page_size
+
+        # Ask user for number of pages to read
+        num_pages = simpledialog.askinteger(
+            "Nombre de pages",
+            f"Nombre de pages à lire (1-{total_pages}):",
+            initialvalue=total_pages,
+            minvalue=1,
+            maxvalue=total_pages,
+            parent=self.root
+        )
+
+        if num_pages is None:
+            return  # User cancelled
+
         self._start_memory_operation(
             label="Lecture EEPROM",
-            command=f"eeprom:{filename}",
+            command=f"eeprom:{filename}:{num_pages}",
             filename=filename,
             success_message=f"EEPROM memory successfully read and saved to:\n{filename}",
             hvpp_command=HVPPCommand.READ_MEMORY,
@@ -1045,6 +1225,7 @@ class HVPPConfiguratorGUI:
             filename=filename,
             success_message=f"Flash memory successfully written from:\n{filename}",
             hvpp_command=HVPPCommand.WRITE_MEMORY,
+            auto_verify=True,
         )
 
     def _on_write_eeprom(self):
@@ -1067,14 +1248,60 @@ class HVPPConfiguratorGUI:
             filename=filename,
             success_message=f"EEPROM memory successfully written from:\n{filename}",
             hvpp_command=HVPPCommand.WRITE_MEMORY,
+            auto_verify=True,
+        )
+
+    def _on_verify_flash(self):
+        """Handle Verify Flash Memory button click"""
+        if not self.programmer:
+            messagebox.showwarning("Warning", "Please connect to the programmer first.")
+            return
+
+        filename = filedialog.askopenfilename(
+            title="Open Flash Memory HEX for Verification",
+            filetypes=[("Intel HEX files", "*.hex"), ("All files", "*.*")]
+        )
+
+        if not filename:
+            return
+
+        self._start_memory_operation(
+            label="Vérification Flash",
+            command=f"flash:{filename}",
+            filename=filename,
+            success_message=f"Flash memory verification successful!\n{filename}",
+            hvpp_command=HVPPCommand.VERIFY_MEMORY,
+        )
+
+    def _on_verify_eeprom(self):
+        """Handle Verify EEPROM Memory button click"""
+        if not self.programmer:
+            messagebox.showwarning("Warning", "Please connect to the programmer first.")
+            return
+
+        filename = filedialog.askopenfilename(
+            title="Open EEPROM Memory HEX for Verification",
+            filetypes=[("Intel HEX files", "*.hex"), ("All files", "*.*")]
+        )
+
+        if not filename:
+            return
+
+        self._start_memory_operation(
+            label="Vérification EEPROM",
+            command=f"eeprom:{filename}",
+            filename=filename,
+            success_message=f"EEPROM memory verification successful!\n{filename}",
+            hvpp_command=HVPPCommand.VERIFY_MEMORY,
         )
 
     def _on_exit(self):
         """Handle Exit button click"""
         if self.programmer:
-            self.programmer.programmer_communicate(HVPPCommand.END, "")
-            # Disable Programmer Log option
-            self.log_menu_item.entryconfig(self.log_menu_index, state="disabled")
+            try:
+                self.programmer.programmer_communicate(HVPPCommand.END, "")
+            except serial.SerialException:
+                pass  # Ignore disconnection on exit
         self.root.quit()
 
     def _on_about(self):
@@ -1135,7 +1362,10 @@ class HVPPConfiguratorGUI:
     def _on_closing(self):
         """Handle window close event"""
         if self.programmer:
-            self.programmer.programmer_communicate(HVPPCommand.END, "")
+            try:
+                self.programmer.programmer_communicate(HVPPCommand.END, "")
+            except serial.SerialException:
+                pass  # Ignore disconnection on close
         self.root.destroy()
 
 
